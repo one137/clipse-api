@@ -52,9 +52,9 @@ func readOrCreateClipboardData(filePath string) (*ClipboardData, error) {
 }
 
 func getClientIP(r *http.Request) string {
-    if ip := r.Header.Get("Cf-Connecting-Ip"); ip != "" {
-        return ip
-    }
+	if ip := r.Header.Get("Cf-Connecting-Ip"); ip != "" {
+		return ip
+	}
 	return r.Header.Get("X-Real-Ip")
 }
 
@@ -136,13 +136,13 @@ func handleGetLatest(w http.ResponseWriter, r *http.Request) {
 
 	latest := clipboardData.ClipboardHistory[0]
 
-	// Parse recorded time and check if within 3 minutes
+	// Parse recorded time and check if within 30 minutes
 	recordedTime, err := time.ParseInLocation("2006-01-02 15:04:05", latest.Recorded, time.Local)
 	if err != nil {
 		http.Error(w, "Invalid time format", http.StatusInternalServerError)
 		return
 	}
-	if time.Since(recordedTime) > 3*time.Minute {
+	if time.Since(recordedTime) > 30*time.Minute {
 		http.Error(w, "No recent entries", http.StatusNotFound)
 		return
 	}
