@@ -1,13 +1,16 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,6 +18,11 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	// Embeds the timezone database: the runtime image has no /usr/share/zoneinfo,
+	// and time.Local would silently fall back to UTC – shifting the window that
+	// /latest applies to entries recorded by clipse in local time.
+	_ "time/tzdata"
 )
 
 type ResponseData struct {
@@ -29,10 +37,13 @@ type ClipboardData struct {
 }
 
 type Config struct {
-	AuthUser string
-	AuthPass string
-	FilePath string
-	MaxBody  int64
+	AuthToken string
+	FilePath  string
+	MaxBody   int64
+
+	// Address range the reverse proxy connects from. Empty means no client
+	// address header is ever believed.
+	TrustedProxy netip.Prefix
 }
 
 const (
@@ -70,28 +81,32 @@ func main() {
 }
 
 // loadConfig reads the environment once, and refuses to start if anything
-// required is missing. An empty AUTH_USER/AUTH_PASS would otherwise let any
-// request through, as basic auth with empty credentials would match.
+// required is missing. An empty AUTH_TOKEN would otherwise let any request
+// through, as it would match a request sending an empty token.
 func loadConfig() Config {
 	c := Config{
-		AuthUser: os.Getenv("AUTH_USER"),
-		AuthPass: os.Getenv("AUTH_PASS"),
-		FilePath: os.Getenv("CLIPBOARD_JSON_FILE"),
-		MaxBody:  defaultMaxBody,
+		AuthToken: os.Getenv("AUTH_TOKEN"),
+		FilePath:  os.Getenv("CLIPBOARD_JSON_FILE"),
+		MaxBody:   defaultMaxBody,
 	}
 
 	var missing []string
-	if c.AuthUser == "" {
-		missing = append(missing, "AUTH_USER")
-	}
-	if c.AuthPass == "" {
-		missing = append(missing, "AUTH_PASS")
+	if c.AuthToken == "" {
+		missing = append(missing, "AUTH_TOKEN")
 	}
 	if c.FilePath == "" {
 		missing = append(missing, "CLIPBOARD_JSON_FILE")
 	}
 	if len(missing) > 0 {
 		log.Fatalf("Missing required env var(s): %s", strings.Join(missing, ", "))
+	}
+
+	if v := os.Getenv("TRUSTED_PROXY_CIDR"); v != "" {
+		prefix, err := netip.ParsePrefix(v)
+		if err != nil {
+			log.Fatalf("TRUSTED_PROXY_CIDR must be a CIDR, got %q", v)
+		}
+		c.TrustedProxy = prefix
 	}
 
 	if v := os.Getenv("MAX_BODY_BYTES"); v != "" {
@@ -105,12 +120,20 @@ func loadConfig() Config {
 	return c
 }
 
+// checkAuth expects an "Authorization: Bearer <token>" header. A token in a
+// header of our own beats basic auth here: browsers cache basic credentials per
+// origin and resend them on their own, which would make the endpoint reachable
+// by CSRF and readable by any XSS on the origin it is proxied under.
 func checkAuth(r *http.Request) bool {
-	username, password, ok := r.BasicAuth()
-	if !ok {
+	const prefix = "Bearer "
+
+	header := r.Header.Get("Authorization")
+	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
 		return false
 	}
-	return username == config.AuthUser && password == config.AuthPass
+
+	token := header[len(prefix):]
+	return subtle.ConstantTimeCompare([]byte(token), []byte(config.AuthToken)) == 1
 }
 
 // plainText makes sure a stored clipboard entry is never served as html, which
@@ -186,11 +209,27 @@ func writeClipboardData(path string, data *ClipboardData) error {
 	return os.Rename(tmp.Name(), path)
 }
 
+// getClientIP returns the address the proxy forwarded, but only for requests
+// that really come from it: any client can set these headers itself, and a
+// forged one would end up in the logs – and from there in fail2ban's jails.
 func getClientIP(r *http.Request) string {
+	peer := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(peer); err == nil {
+		peer = host
+	}
+
+	addr, err := netip.ParseAddr(peer)
+	if err != nil || !config.TrustedProxy.Contains(addr.Unmap()) {
+		return peer
+	}
+
 	if ip := r.Header.Get("Cf-Connecting-Ip"); ip != "" {
 		return ip
 	}
-	return r.Header.Get("X-Real-Ip")
+	if ip := r.Header.Get("X-Real-Ip"); ip != "" {
+		return ip
+	}
+	return peer
 }
 
 func handlePost(w http.ResponseWriter, r *http.Request) {
@@ -250,7 +289,7 @@ func handleGetLatest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("GET /latest from %s", r.RemoteAddr)
+	log.Printf("GET /latest from %s", getClientIP(r))
 
 	clipboardData, err := readClipboardData(config.FilePath)
 	if err != nil {
